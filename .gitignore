@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Virtualenvs / envs
+envs/
+.venv/
+venv/
+env/
+
+# Training outputs (mounted/built at runtime, never committed)
+runs/
+ckpts/
+ckpt_*/
+*.bin
+*.safetensors
+*.pt
+*.ckpt
+*.pth
+
+# Logs
+_logs/
+*.log
+nohup.out
+
+# HF cache
+hf_cache/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
