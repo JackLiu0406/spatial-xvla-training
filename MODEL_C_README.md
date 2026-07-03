@@ -2,7 +2,13 @@
 
 This branch carries the Model C DA3/T5 spatial-language XVLA training pipeline.
 
-Because this training node has GitHub connector access but no local `gh` CLI or HTTPS git credential, the exact local commit is included as a compressed patch bundle in `model_c_patch_chunks/`. Apply it with the instructions in `APPLY_MODEL_C_PATCH.md` to materialize the full code changes.
+The exact local code commit is available as a compressed patch artifact because this training node has GitHub connector access but no local `gh` CLI or HTTPS git credential for a direct source push. See `APPLY_MODEL_C_PATCH.md` for the one-command path to materialize the full code changes from the Hugging Face artifact.
+
+Patch artifact:
+
+```text
+https://huggingface.co/JackLiu0406/DA3-XVLA-roboreal-ablations/resolve/main/model-c-spatialboost-training-pipeline/model_c_spatialboost_pipeline.patch.gz
+```
 
 ## Model Summary
 
