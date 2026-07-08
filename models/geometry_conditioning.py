@@ -514,6 +514,36 @@ class SegmentedDA3GeometryConditioner(nn.Module):
         if self._da3_input_dim is not None:
             self._build_projector(int(self._da3_input_dim))
 
+        # Optional FACTORIZED 3D learnable positional embedding added to projected
+        # DPT features BEFORE the perceiver. Three small learnable tables —
+        # `view_emb [V, D]`, `y_emb [H, D]`, `x_emb [W, D]` — are broadcast-summed
+        # to produce a `[V, H, W, D]` per-position embedding, then flattened to
+        # `[V*H*W, D]`. This is DETR/Perceiver-IO/OpenVLA style: explicit (view,
+        # row, col) structural prior at a fraction of the params of a flat 1D
+        # pos_emb (~130 K params vs ~12.6 M for V=3, fs=64, D=1024).
+        # Only active for the plain "perceiver" resampler path (the multi-view
+        # variants do their own positional handling).
+        self.use_input_pos_emb = bool(g("perceiver_input_pos_emb", default=False))
+        if self.use_input_pos_emb:
+            V = int(g("perceiver_input_views", default=3))
+            fs = int(g("da3_feature_size", default=64))
+            self._pos_emb_views = V
+            self._pos_emb_h = fs
+            self._pos_emb_w = fs
+            self._input_pos_emb_n = V * fs * fs
+            self.view_emb = nn.Parameter(torch.zeros(V, self.hidden_dim))
+            self.y_emb    = nn.Parameter(torch.zeros(fs, self.hidden_dim))
+            self.x_emb    = nn.Parameter(torch.zeros(fs, self.hidden_dim))
+            nn.init.normal_(self.view_emb, std=0.02)
+            nn.init.normal_(self.y_emb,    std=0.02)
+            nn.init.normal_(self.x_emb,    std=0.02)
+        else:
+            self.register_parameter("view_emb", None)
+            self.register_parameter("y_emb",    None)
+            self.register_parameter("x_emb",    None)
+            self._input_pos_emb_n = 0
+            self._pos_emb_views = self._pos_emb_h = self._pos_emb_w = 0
+
         # Per-view token budget (perceiver_per_view only). When set, one
         # GeometryTokenResampler is built per entry; outputs are concatenated.
         # sum(geometry_tokens_per_view) must equal num_geometry_tokens.
@@ -765,6 +795,29 @@ class SegmentedDA3GeometryConditioner(nn.Module):
             )
         tokens = self.input_proj(tokens)             # [B, N, D]
 
+        # Add factorized 3D learnable positional embedding to the dense spatial
+        # map BEFORE the perceiver. Gives queries explicit (view, row, col)
+        # structure to attend over, with ~96× fewer params than a flat 1D
+        # pos_emb. Only for the plain "perceiver" path.
+        if self.use_input_pos_emb and self.resampler_type == "perceiver":
+            V, H, W = self._pos_emb_views, self._pos_emb_h, self._pos_emb_w
+            expected_n = V * H * W
+            if tokens.shape[1] != expected_n:
+                raise ValueError(
+                    f"perceiver_input_pos_emb shape mismatch: tokens have "
+                    f"N={tokens.shape[1]} but pos_emb was built for V={V}, H={H}, "
+                    f"W={W} → expected N={expected_n}. Set perceiver_input_views "
+                    f"and da3_feature_size to match the dense input dimensions."
+                )
+            # Broadcast-sum: [V,1,1,D] + [1,H,1,D] + [1,1,W,D] → [V,H,W,D]
+            pos = (
+                self.view_emb[:, None, None, :]
+                + self.y_emb[None, :, None, :]
+                + self.x_emb[None, None, :, :]
+            )
+            pos = pos.reshape(1, expected_n, self.hidden_dim).to(tokens.dtype)
+            tokens = tokens + pos
+
         if self.resampler_type == "perceiver":
             geom = self.resampler(tokens)            # [B, K, D]
         else:
@@ -841,10 +894,195 @@ class GeometryCrossAttentionFusion(nn.Module):
         return x
 
 
+class GatedSpatialCrossAttention(nn.Module):
+    """
+    Gated action-to-spatial cross-attention adapter.
+
+    Lives INSIDE the policy transformer's block stack (one instance per layer
+    that should fuse spatial info into the action stream). Operates ONLY on
+    the action-token slice of the policy sequence; never touches VLM tokens.
+
+        h_new = h + beta * CrossAttention(q=LN(h), k=v=LN(spatial_proj(spatial)))
+
+    Where:
+      * `h` is the per-layer action hidden states `x[:, :num_actions, :]`
+      * `spatial` is the Perceiver-downsampled DA3/VGGT spatial tokens
+        `[B, K_spatial, spatial_token_dim]`
+      * `spatial_proj` is a learned Linear(spatial_token_dim → hidden_dim) when
+        spatial_token_dim != hidden_dim, else Identity
+      * `beta` is a learned scalar gate (single parameter, init to `gate_init`,
+        default 0.0). With gate_init=0 the adapter is byte-identical to "absent"
+        at step 0; with 1e-3 it adds a small but non-zero residual signal.
+
+    Why: this ablation tests whether Perceiver-downsampled spatial tokens
+    improve the action expert when they reach action hidden states ONLY via
+    a direct, gated cross-attention path — i.e., the action transformer is
+    the SOLE place VLM and spatial information get fused, via the action
+    hidden states as queries. The existing GeometryCrossAttentionFusion
+    (which fuses VLM+aux+soft+action tokens with spatial BEFORE the policy
+    blocks) is bypassed when use_spatial_cross_attention=True.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int = 8,
+        spatial_token_dim: Optional[int] = None,
+        gate_init: float = 0.0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        s_dim = self.hidden_dim if spatial_token_dim is None else int(spatial_token_dim)
+        # Project spatial token dim → action hidden dim when they differ.
+        # Default: spatial tokens are already at hidden_dim (the Perceiver
+        # output matches the transformer's hidden_size by construction),
+        # so this is typically Identity.
+        if s_dim == self.hidden_dim:
+            self.spatial_proj = nn.Identity()
+        else:
+            self.spatial_proj = nn.Linear(s_dim, self.hidden_dim)
+        self.q_norm = nn.LayerNorm(self.hidden_dim)
+        self.kv_norm = nn.LayerNorm(self.hidden_dim)
+        self.attn = nn.MultiheadAttention(
+            self.hidden_dim,
+            num_heads=int(num_heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        # Learned scalar gate. Single param so the experiment cleanly probes
+        # "does the model open the gate at all?" — visible in saved ckpts.
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def forward(
+        self, action_hidden: torch.Tensor, spatial_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        action_hidden : Tensor, [B, T_action, hidden_dim]
+        spatial_tokens : Tensor, [B, K_spatial, spatial_token_dim]
+
+        Returns
+        -------
+        Tensor, [B, T_action, hidden_dim] — gated residual update of action_hidden.
+        """
+        kv = self.spatial_proj(spatial_tokens)            # [B, K, hidden_dim]
+        q = self.q_norm(action_hidden)                    # [B, T_action, hidden_dim]
+        kv_n = self.kv_norm(kv)                           # [B, K, hidden_dim]
+        attn_out, _ = self.attn(q, kv_n, kv_n, need_weights=False)
+        return action_hidden + self.gate * attn_out
+
+
+class PerTokenGatedSpatialCrossAttention(nn.Module):
+    """
+    Per-token gated action-to-spatial cross-attention adapter (GatedFusion-style).
+
+    Same role as ``GatedSpatialCrossAttention`` but with a per-token, per-channel
+    gate instead of a single layer-scalar. Each action token computes its OWN
+    gate from its (semantic-context-laden) hidden state, so different action
+    steps can use geometry differently.
+
+        gate = sigmoid(gate_mlp(LN(action_hidden)))   # [B, T, hidden] in [0, 1]
+        h_new = action_hidden + gate ⊙ CrossAttention(q=h, k=v=spatial)
+
+    Matches the winning recipe (GatedFusion) reported on LIBERO benchmarks where
+    "learnable gates dynamically balance semantic and geometric features at each
+    token position based on global semantic context." Our action_hidden already
+    encodes VLM context from earlier self-attention layers, so it serves as the
+    semantic-context input naturally.
+
+    Init contract (DiT-style identity at step 0):
+      * ``attn.out_proj.weight`` is zeroed by HF's loader (we exploit this) →
+        ``attn_out = 0`` at step 0 → ``adapter_out = action_hidden`` regardless
+        of what the gate values are.
+      * ``gate_mlp`` is initialized with PyTorch defaults → gate ≈ sigmoid(0)=0.5
+        everywhere at step 0. Doesn't matter at step 0 (multiplied by zero), but
+        gradients ∂L/∂out_proj_w = ∂L/∂h * gate * attn_pre^T ≠ 0 so out_proj
+        learns immediately. Once out_proj is non-zero, ∂L/∂gate_mlp ≠ 0 too.
+
+    Parameter cost vs scalar:
+      * scalar:    ~4.20 M / layer
+      * per-token: ~4.72 M / layer  (gate_mlp adds ~524 K with default bottleneck)
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int = 8,
+        spatial_token_dim: Optional[int] = None,
+        gate_mlp_hidden: Optional[int] = None,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        s_dim = self.hidden_dim if spatial_token_dim is None else int(spatial_token_dim)
+        # Default bottleneck = hidden_dim // 4 (e.g., 256 for hidden=1024).
+        gh = self.hidden_dim // 4 if gate_mlp_hidden is None else int(gate_mlp_hidden)
+
+        # Spatial → hidden projection (Identity when dims already match).
+        if s_dim == self.hidden_dim:
+            self.spatial_proj = nn.Identity()
+        else:
+            self.spatial_proj = nn.Linear(s_dim, self.hidden_dim)
+
+        # Cross-attention path (identical to scalar variant).
+        self.q_norm = nn.LayerNorm(self.hidden_dim)
+        self.kv_norm = nn.LayerNorm(self.hidden_dim)
+        self.attn = nn.MultiheadAttention(
+            self.hidden_dim,
+            num_heads=int(num_heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+
+        # Per-token gate: small 2-layer MLP over action_hidden produces a
+        # per-token, per-channel gate logit. Sigmoid bounds it to [0, 1] in
+        # the forward pass.
+        self.gate_norm = nn.LayerNorm(self.hidden_dim)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(self.hidden_dim, gh),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(gh, self.hidden_dim),
+        )
+
+    def forward(
+        self, action_hidden: torch.Tensor, spatial_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        action_hidden : Tensor, [B, T_action, hidden_dim]
+        spatial_tokens : Tensor, [B, K_spatial, spatial_token_dim]
+
+        Returns
+        -------
+        Tensor, [B, T_action, hidden_dim] — per-token gated residual update.
+        """
+        # Project spatial K/V into the policy's hidden space.
+        kv = self.spatial_proj(spatial_tokens)            # [B, K, hidden_dim]
+
+        # Cross-attention: action queries spatial.
+        q = self.q_norm(action_hidden)                    # [B, T_action, hidden_dim]
+        kv_n = self.kv_norm(kv)                           # [B, K, hidden_dim]
+        attn_out, _ = self.attn(q, kv_n, kv_n, need_weights=False)
+        # attn_out: [B, T_action, hidden_dim]
+
+        # Per-token per-channel gate from action context. Using the raw
+        # action_hidden (not q which has q_norm applied) so the gate sees the
+        # residual-stream representation with VLM context from earlier layers.
+        gate_input = self.gate_norm(action_hidden)
+        gate = torch.sigmoid(self.gate_mlp(gate_input))   # [B, T_action, hidden_dim]
+
+        return action_hidden + gate * attn_out
+
+
 __all__ = [
     "DA3LatentSegmenter",
     "SegmentedDA3GeometryConditioner",
     "GeometryTokenResampler",
     "PerceiverResampler",
     "GeometryCrossAttentionFusion",
+    "GatedSpatialCrossAttention",
+    "PerTokenGatedSpatialCrossAttention",
 ]

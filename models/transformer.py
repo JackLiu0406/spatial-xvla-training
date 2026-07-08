@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import math
 from functools import partial
-from typing import Final, Iterable, Optional, Tuple
+from typing import Dict, Final, Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -324,7 +324,36 @@ class SoftPromptedTransformer(nn.Module):
         self.geometry_fusion_position = str(gc.get("fusion_position", "before_policy"))
         self.geometry_debug_shapes = bool(gc.get("debug_shapes", False))
         self._geom_shape_logged = False
-        if self.geometry_enabled and gc.get("fusion_type", "cross_attention") == "cross_attention":
+        spatial_lang_cfg = gc.get("spatial_lang", {}) or {}
+        self.spatial_lang_enabled = bool(spatial_lang_cfg.get("enabled", False))
+        self.spatial_lang_method = str(spatial_lang_cfg.get("method", "post_refiner")).lower()
+        self.spatial_residual_scale = float(spatial_lang_cfg.get("spatial_scale_start", 0.01))
+        self.last_spatial_stats: Dict[str, torch.Tensor] = {}
+
+        # DA3-XVLA ablation: gated action-to-spatial cross-attention adapter.
+        # When use_spatial_cross_attention=True, the OLD GeometryCrossAttentionFusion
+        # is bypassed entirely (spatial info does NOT touch VLM tokens). Instead,
+        # a GatedSpatialCrossAttention adapter is attached to each (or selected)
+        # transformer block; it operates ONLY on the action-token slice with
+        # geometry_tokens as K/V. See models/geometry_conditioning.py for module.
+        self.use_spatial_cross_attention = bool(gc.get("use_spatial_cross_attention", False))
+        # Where the cross-attention update lands: action slice only (default,
+        # preserves the VLM wall) vs the entire policy sequence (spatial reaches
+        # vlm/aux/soft too). See _apply_spatial_xattn() in forward.
+        self.spatial_xattn_target = str(
+            gc.get("spatial_cross_attention_target", "action_only")
+        ).lower()
+        if self.spatial_xattn_target not in ("action_only", "full_sequence"):
+            raise ValueError(
+                f"spatial_cross_attention_target={self.spatial_xattn_target!r} "
+                "(expected 'action_only' or 'full_sequence')."
+            )
+
+        if (
+            self.geometry_enabled
+            and gc.get("fusion_type", "cross_attention") == "cross_attention"
+            and not self.use_spatial_cross_attention
+        ):
             self.geometry_fusion = GeometryCrossAttentionFusion(
                 dim=hidden_size,
                 num_heads=int(gc.get("cross_attention_heads", 8)),
@@ -338,6 +367,92 @@ class SoftPromptedTransformer(nn.Module):
         self.blocks = nn.ModuleList(
             [TransformerBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)]
         )
+
+        # Build gated spatial cross-attention adapters (one per block; None for
+        # layers that should not apply the adapter). Only built when enabled.
+        self.spatial_cross_attn_layers: Optional[nn.ModuleList] = None
+        if self.geometry_enabled and self.use_spatial_cross_attention:
+            from .geometry_conditioning import (
+                GatedSpatialCrossAttention,
+                PerTokenGatedSpatialCrossAttention,
+            )
+
+            # Resolve which layers get the adapter.
+            # Accepted values:
+            #   "all"               — every block (default)
+            #   "middle_late" / "late_half" / "last_half"
+            #                       — last 50% of blocks: indices [depth//2, depth)
+            #   "early_half" / "first_half"
+            #                       — first 50% of blocks: indices [0, depth//2)
+            #   "late_quarter"      — last 25% of blocks: indices [3*depth//4, depth)
+            #   int                 — single block index
+            #   list[int]/tuple     — explicit indices (negatives tolerated, modulo depth)
+            spec = gc.get("spatial_cross_attention_layers", "all")
+            if spec is None or (isinstance(spec, str) and spec.lower() == "all"):
+                layer_set = set(range(depth))
+            elif isinstance(spec, str) and spec.lower() in (
+                "middle_late", "late_half", "last_half",
+            ):
+                layer_set = set(range(depth // 2, depth))
+            elif isinstance(spec, str) and spec.lower() in (
+                "early_half", "first_half",
+            ):
+                layer_set = set(range(0, depth // 2))
+            elif isinstance(spec, str) and spec.lower() == "late_quarter":
+                layer_set = set(range((3 * depth) // 4, depth))
+            elif isinstance(spec, int) and not isinstance(spec, bool):
+                layer_set = {spec % depth}
+            else:
+                # list/tuple of ints; tolerate negative indices.
+                layer_set = {int(i) % depth for i in spec}
+
+            # Action hidden dim defaults to transformer hidden_size; allow
+            # override for forward-compat (heterogeneous projection setups).
+            action_hidden_dim = int(gc.get("action_hidden_dim") or hidden_size)
+            spatial_token_dim_cfg = gc.get("spatial_token_dim", None)
+            spatial_num_heads = int(gc.get("spatial_cross_attention_heads",
+                                          gc.get("cross_attention_heads", 8)))
+            spatial_dropout = float(gc.get("spatial_cross_attention_dropout",
+                                           gc.get("cross_attention_dropout", 0.0)))
+            gate_init = float(gc.get("spatial_gate_init", 0.0))
+
+            # Dispatcher: scalar (legacy) vs per-token (GatedFusion paper winner).
+            gate_type = str(gc.get("spatial_gate_type", "scalar")).lower()
+            if gate_type == "per_token":
+                gate_mlp_hidden_cfg = gc.get("spatial_gate_mlp_hidden", None)
+                def _make_adapter() -> nn.Module:
+                    return PerTokenGatedSpatialCrossAttention(
+                        hidden_dim=action_hidden_dim,
+                        num_heads=spatial_num_heads,
+                        spatial_token_dim=spatial_token_dim_cfg,
+                        gate_mlp_hidden=gate_mlp_hidden_cfg,
+                        dropout=spatial_dropout,
+                    )
+            elif gate_type == "scalar":
+                def _make_adapter() -> nn.Module:
+                    return GatedSpatialCrossAttention(
+                        hidden_dim=action_hidden_dim,
+                        num_heads=spatial_num_heads,
+                        spatial_token_dim=spatial_token_dim_cfg,
+                        gate_init=gate_init,
+                        dropout=spatial_dropout,
+                    )
+            else:
+                raise ValueError(
+                    f"spatial_gate_type={gate_type!r} not supported "
+                    "(expected 'scalar' or 'per_token')."
+                )
+
+            modules = []
+            for i in range(depth):
+                if i in layer_set:
+                    modules.append(_make_adapter())
+                else:
+                    modules.append(nn.Identity())  # ModuleList entries can't be None
+            self.spatial_cross_attn_layers = nn.ModuleList(modules)
+            # Mirror the layer_set for fast checking inside forward (avoids
+            # isinstance-on-Identity for every layer).
+            self._spatial_layer_active = layer_set
 
         if use_hetero_proj:
             self.vlm_proj = DomainAwareLinear(multi_modal_input_size, hidden_size, num_domains=num_domains)
@@ -359,7 +474,142 @@ class SoftPromptedTransformer(nn.Module):
             self.soft_prompt_hub = nn.Embedding(num_domains, len_soft_prompts * hidden_size)
             nn.init.normal_(self.soft_prompt_hub.weight, std=0.02)
 
+        # =========================================================================
+        # GeoStack-XVLA v3 — Side stack for action-expert spatial-language conditioning
+        # =========================================================================
+        # Asymmetric parallel transformer: refines [DA3 deep | T5] bank through depth,
+        # action expert action-tokens cross-attend at paired layers via gated adapters.
+        # Identity-at-step-0 via zero-init out_proj + closed gate + alpha schedule.
+        side_cfg = gc.get("side_stack", {}) or {}
+        self.side_stack_enabled = bool(side_cfg.get("enabled", False))
+        self.side_stack = None
+        self.s_to_x_xattn = None
+        self.side_alpha_schedule = None
+        self._side_pairing_map: Dict[int, int] = {}
+        if self.side_stack_enabled:
+            from .side_stack import SideStack, GatedCrossAttn, default_pairing
+            from .geostack import AlphaSchedule
+            side_depth   = int(side_cfg.get("depth", 6))
+            side_hidden  = int(side_cfg.get("hidden_dim", hidden_size))
+            side_heads   = int(side_cfg.get("num_heads", num_heads))
+            side_mlp_r   = float(side_cfg.get("mlp_ratio", 4.0))
+            side_dropout = float(side_cfg.get("dropout", 0.0))
+            self.side_stack = SideStack(
+                n_layers=side_depth, hidden_dim=side_hidden,
+                num_heads=side_heads, mlp_ratio=side_mlp_r, dropout=side_dropout,
+            )
+            # Pairing: which action-expert layer fires cross-attn to which side layer.
+            # Default: every (depth / side_depth)-th action layer; last side layer
+            # always pairs with the LAST action layer.
+            self._side_pairing_map = default_pairing(depth, side_depth)
+            # One cross-attn adapter per pairing point (action queries side, gated).
+            n_pair = len(self._side_pairing_map)
+            self.s_to_x_xattn = nn.ModuleList([
+                GatedCrossAttn(
+                    hidden_dim=hidden_size,
+                    num_heads=int(side_cfg.get("xattn_num_heads", 8)),
+                    gate_init_bias=float(side_cfg.get("gate_init_bias", -4.0)),
+                    dropout=float(side_cfg.get("xattn_dropout", 0.0)),
+                ) for _ in range(n_pair)
+            ])
+            self.side_alpha_schedule = AlphaSchedule(
+                warmup_iters=int(side_cfg.get("alpha_warmup_iters", 5000)),
+                ramp_to_01_iters=int(side_cfg.get("alpha_ramp_to_01_iters", 10000)),
+                ramp_to_1_iters=int(side_cfg.get("alpha_ramp_to_1_iters", 20000)),
+                alpha_at_warmup_end=float(side_cfg.get("alpha_at_warmup_end", 0.001)),
+            )
+            # Whether cross-attn Q is just the action slice (cheaper) or full seq.
+            self.side_xattn_target = str(
+                side_cfg.get("xattn_target", "action_only")
+            ).lower()
+            if self.side_xattn_target not in ("action_only", "full_sequence"):
+                raise ValueError(f"side_xattn_target must be 'action_only' or 'full_sequence', got {self.side_xattn_target!r}")
+
+            # v3.7 — BIDIRECTIONAL cross-attention.
+            # When enabled, at each pairing point the side stack ALSO queries the
+            # action expert state (s queries x). This makes the side stack's K/V
+            # output ACTION-CONTEXT-AWARE: it knows what the action expert is
+            # currently "asking" and can produce features tailored to that question.
+            #
+            # Motivation: in v3.6 ckpt-5000, cross-attn was only 1.83% effective
+            # (action change when bank zeroed). Side stack trained via aux loss but
+            # cross-attn adapters barely moved. Adding x_to_s gives the side stack
+            # an ADDITIONAL gradient path back FROM the action expert, plus makes
+            # its outputs more action-relevant via direct action-context conditioning.
+            #
+            # Identity-at-step-0 preserved by the same α schedule.
+            self.side_xattn_bidirectional = bool(side_cfg.get("bidirectional", False))
+            self.x_to_s_xattn = None
+            if self.side_xattn_bidirectional:
+                self.x_to_s_xattn = nn.ModuleList([
+                    GatedCrossAttn(
+                        hidden_dim=hidden_size,
+                        num_heads=int(side_cfg.get("xattn_num_heads", 8)),
+                        gate_init_bias=float(side_cfg.get("gate_init_bias", -4.0)),
+                        dropout=float(side_cfg.get("xattn_dropout", 0.0)),
+                    ) for _ in range(n_pair)
+                ])
+
+        # ------------------------------------------------------------------
+        # Spatial-language Method A/B. Built only when explicitly enabled.
+        # The shared DA3/T5 tokenizer lives on XVLA; these modules consume its
+        # three per-view banks and update only the action-token slice.
+        # ------------------------------------------------------------------
+        self.spatial_refiner = None
+        self.spatial_injection_layers = None
+        self.spatial_injection_start = int(spatial_lang_cfg.get("method_b_start_layer", max(0, depth - 6)))
+        if self.spatial_lang_enabled:
+            from .spatial_language import SpatialActionInjectionLayer, SpatialActionRefiner
+            if self.spatial_lang_method in ("post_refiner", "method_a", "a"):
+                self.spatial_refiner = SpatialActionRefiner(
+                    hidden_dim=hidden_size,
+                    num_heads=int(spatial_lang_cfg.get("spatial_heads", 8)),
+                    depth=int(spatial_lang_cfg.get("method_a_layers", 6)),
+                    dropout=float(spatial_lang_cfg.get("dropout", 0.0)),
+                )
+            elif self.spatial_lang_method in ("final6_injection", "method_b", "b"):
+                n_inject = max(0, depth - self.spatial_injection_start)
+                self.spatial_injection_layers = nn.ModuleList([
+                    SpatialActionInjectionLayer(
+                        hidden_dim=hidden_size,
+                        num_heads=int(spatial_lang_cfg.get("spatial_heads", 8)),
+                        dropout=float(spatial_lang_cfg.get("dropout", 0.0)),
+                    )
+                    for _ in range(n_inject)
+                ])
+            else:
+                raise ValueError(
+                    f"spatial_lang.method={self.spatial_lang_method!r} "
+                    "(expected 'post_refiner' or 'final6_injection')"
+                )
+
         self.apply(basic_init)
+
+    def set_side_alpha_step(self, step: int) -> None:
+        """Training loop calls this each iter so the side stack alpha advances."""
+        if self.side_alpha_schedule is not None:
+            self.side_alpha_schedule.set_step(int(step))
+
+    def set_spatial_residual_scale(self, scale: float) -> None:
+        """Set fixed scheduled scale for Method A/B spatial residual updates."""
+        self.spatial_residual_scale = float(scale)
+
+    @staticmethod
+    def _summarize_spatial_stats(stats_list) -> Dict[str, torch.Tensor]:
+        if not stats_list:
+            return {}
+        out = {}
+        for key in ("h_action_norm", "main", "left", "right", "merge"):
+            vals = [s[key] for s in stats_list if key in s]
+            if vals:
+                out[key] = torch.stack(vals).mean()
+        h = out.get("h_action_norm", None)
+        if h is not None:
+            denom = h.clamp_min(1e-6)
+            for key in ("main", "left", "right", "merge"):
+                if key in out:
+                    out[f"ratio_{key}"] = out[key] / denom
+        return out
 
     def forward(
         self,
@@ -370,7 +620,11 @@ class SoftPromptedTransformer(nn.Module):
         proprio: torch.Tensor,
         t: torch.Tensor,
         geometry_tokens: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        spatial_lang_bank: Optional[torch.Tensor] = None,    # v3: side stack input
+        spatial_lang_bank_pad: Optional[torch.Tensor] = None,  # v3: bank padding mask
+        spatial_lang_banks: Optional[Dict[str, torch.Tensor]] = None,  # Method A/B per-view banks
+        return_side_state: bool = False,                     # v3.5: return final side stack state for aux loss
+    ):
         """
         Forward pass.
 
@@ -392,6 +646,7 @@ class SoftPromptedTransformer(nn.Module):
             Predicted actions, [B, T_action, dim_action]
         """
         B, num_actions = action_with_noise.shape[:2]
+        self.last_spatial_stats = {}
         do_fuse = (
             self.geometry_fusion is not None and geometry_tokens is not None
         )
@@ -448,6 +703,29 @@ class SoftPromptedTransformer(nn.Module):
         if do_fuse and self.geometry_fusion_position == "before_policy":
             x = self.geometry_fusion(x, geometry_tokens)
 
+        # Gated action-to-spatial cross-attention runs IF (a) configured AND
+        # (b) geometry_tokens were provided. Bypass is byte-identical when
+        # either is false (preserves baseline behavior for old configs).
+        do_spatial = (
+            self.spatial_cross_attn_layers is not None
+            and geometry_tokens is not None
+        )
+
+        # GeoStack v3 — side stack co-evolution state.
+        # `s` starts as the input bank and gets stepped at every pairing point
+        # by the corresponding side stack block, then cross-attended INTO `x`.
+        do_side = (
+            self.side_stack_enabled
+            and self.side_stack is not None
+            and spatial_lang_bank is not None
+        )
+        if do_side:
+            s = spatial_lang_bank.to(x.dtype)
+            side_alpha = self.side_alpha_schedule.value()
+        else:
+            s = None
+            side_alpha = 0.0
+
         # Transformer backbone (optionally fuse once mid-stack).
         n_blocks = len(self.blocks)
         mid = n_blocks // 2
@@ -459,10 +737,102 @@ class SoftPromptedTransformer(nn.Module):
                 and i == mid
             ):
                 x = self.geometry_fusion(x, geometry_tokens)
+            # DA3-XVLA: gated cross-attention adapter from policy tokens to
+            # the K=160 spatial bank. Two dispatch modes:
+            #   "action_only"    → only action slice queries spatial (preserves
+            #                      the VLM wall). VLM/aux/soft pass through.
+            #   "full_sequence"  → the entire policy sequence queries spatial.
+            #                      VLM, aux, soft all receive spatial updates.
+            #                      Broader fusion at the cost of breaking the wall.
+            if do_spatial and i in self._spatial_layer_active:
+                adapter = self.spatial_cross_attn_layers[i]
+                if self.spatial_xattn_target == "full_sequence":
+                    # Entire sequence queries spatial; adapter Q-length is flexible.
+                    x = adapter(x, geometry_tokens)
+                else:  # "action_only"
+                    action_hidden = x[:, :num_actions]
+                    updated_action = adapter(action_hidden, geometry_tokens)
+                    x = torch.cat([updated_action, x[:, num_actions:]], dim=1)
+
+            # ─── GeoStack v3: side stack co-evolution ─────────────────────────
+            # At each paired action layer i: first step the corresponding side
+            # block (so s_{side_idx} is fresh), then cross-attend.
+            # v3.7: optionally BIDIRECTIONAL — both x queries s AND s queries x.
+            if do_side and i in self._side_pairing_map:
+                side_idx = self._side_pairing_map[i]
+                s = self.side_stack.step(s, side_idx, key_padding_mask=spatial_lang_bank_pad)
+
+                # Compute BOTH updates in parallel using the SAME pre-update x and s.
+                # This avoids order-dependence (s-updates-with-new-x vs x-updates-with-new-s).
+                # If bidirectional disabled, x_to_s_xattn is None and s_new == s.
+                if self.side_xattn_target == "full_sequence":
+                    x_new = self.s_to_x_xattn[side_idx](
+                        x, s, alpha=side_alpha, kv_padding_mask=spatial_lang_bank_pad,
+                    )
+                else:  # action_only
+                    action_hidden = x[:, :num_actions]
+                    updated_action = self.s_to_x_xattn[side_idx](
+                        action_hidden, s, alpha=side_alpha, kv_padding_mask=spatial_lang_bank_pad,
+                    )
+                    x_new = torch.cat([updated_action, x[:, num_actions:]], dim=1)
+
+                if self.x_to_s_xattn is not None:
+                    # Side stack queries action expert state. K/V is the full action
+                    # expert sequence [action | vlm | aux | soft]; no padding mask
+                    # needed (no padded positions in the main action expert stream).
+                    s_new = self.x_to_s_xattn[side_idx](
+                        s, x, alpha=side_alpha, kv_padding_mask=None,
+                    )
+                else:
+                    s_new = s
+
+                # Atomic update
+                x, s = x_new, s_new
+
+            # ─── Spatial-language Method B: inject after final XVLA blocks ───
+            if (
+                self.spatial_injection_layers is not None
+                and spatial_lang_banks is not None
+                and i >= self.spatial_injection_start
+            ):
+                inj_idx = i - self.spatial_injection_start
+                if 0 <= inj_idx < len(self.spatial_injection_layers):
+                    h_action = x[:, :num_actions]
+                    h_action, stats = self.spatial_injection_layers[inj_idx](
+                        h_action,
+                        spatial_lang_banks["main"],
+                        spatial_lang_banks["left"],
+                        spatial_lang_banks["right"],
+                        spatial_scale=self.spatial_residual_scale,
+                        return_stats=True,
+                    )
+                    prior = self.last_spatial_stats.get("_raw", [])
+                    prior.append(stats)
+                    self.last_spatial_stats["_raw"] = prior
+                    x = torch.cat([h_action, x[:, num_actions:]], dim=1)
+
+        if "_raw" in self.last_spatial_stats:
+            raw = self.last_spatial_stats.pop("_raw")
+            self.last_spatial_stats.update(self._summarize_spatial_stats(raw))
 
         # --- Geometry fusion: after policy ---------------------------------
         if do_fuse and self.geometry_fusion_position == "after_policy":
             x = self.geometry_fusion(x, geometry_tokens)
 
         # Decode only the action segment
-        return self.action_decoder(self.norm(x[:, :num_actions]), domain_id)
+        h_action = x[:, :num_actions]
+        # Spatial-language Method A: 6-layer post-XVLA action-only refiner.
+        if self.spatial_refiner is not None and spatial_lang_banks is not None:
+            h_action, stats = self.spatial_refiner(
+                h_action,
+                spatial_lang_banks,
+                spatial_scale=self.spatial_residual_scale,
+                return_stats=True,
+            )
+            self.last_spatial_stats.update(self._summarize_spatial_stats(stats))
+        pred_action = self.action_decoder(self.norm(h_action), domain_id)
+        if return_side_state:
+            # Return the final side stack state (after all blocks, post-cross-attn).
+            # When side stack is disabled, returns None so caller can skip aux loss.
+            return pred_action, (s if do_side else None)
+        return pred_action

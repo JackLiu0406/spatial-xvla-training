@@ -35,3 +35,4 @@ hf_cache/
 .idea/
 *.swp
 *.swo
+*.bak-*
