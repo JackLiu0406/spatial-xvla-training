@@ -1,0 +1,33 @@
+# envs / caches / build
+openpi/.venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.uv_cache/
+*.egg-info/
+
+# training outputs (never commit these)
+checkpoints/
+pi05_runs/
+wandb/
+*.log
+assets/*/*/norm_stats.json
+
+# data / weights / caches
+DATASETS/
+datasets/
+hf_cache/
+*.pkl
+*.mp4
+*.parquet
+*.safetensors
+*.msgpack
+*.orbax-checkpoint-tmp-*
+
+# secrets — never
+.env
+*.pem
+*.key
+id_ed25519*
+*credentials*
