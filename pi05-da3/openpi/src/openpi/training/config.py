@@ -984,7 +984,7 @@ _CONFIGS = [
             ),
             # RoboTwin2 tasks need their OWN ModernBERT lang cache (built by precompute over the
             # robotwin2 tasks.jsonl) — else inline DA3 falls back to a constant lang embedding.
-            da3_cache=DA3CacheConfig(inline=True, lang_cache="/work/jack/da3_cache/modernbert_robotwin2_lang.pkl"),
+            da3_cache=DA3CacheConfig(inline=True, bgr_to_rgb=True, lang_cache="/work/jack/da3_cache/modernbert_robotwin2_lang.pkl"),  # robotwin2 videos are BGR-swapped -> correct at load
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params",
@@ -1076,7 +1076,7 @@ _CONFIGS = [
                     )
                 ]
             ),
-            da3_cache=DA3CacheConfig(inline=True, lang_cache="/work/jack/da3_cache/modernbert_robotwin2_lang.pkl"),
+            da3_cache=DA3CacheConfig(inline=True, bgr_to_rgb=True, lang_cache="/work/jack/da3_cache/modernbert_robotwin2_lang.pkl"),  # robotwin2 videos are BGR-swapped -> correct at load
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params",
@@ -1172,7 +1172,7 @@ _CONFIGS = [
                     )
                 ]
             ),
-            da3_cache=DA3CacheConfig(inline=True, lang_cache="/work/jack/da3_cache/modernbert_robotwin2_lang.pkl"),
+            da3_cache=DA3CacheConfig(inline=True, bgr_to_rgb=True, lang_cache="/work/jack/da3_cache/modernbert_robotwin2_lang.pkl"),  # robotwin2 videos are BGR-swapped -> correct at load
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params",
@@ -1319,7 +1319,7 @@ _CONFIGS = [
                     )
                 ]
             ),
-            da3_cache=DA3CacheConfig(inline=True, lang_cache="/work/jack/da3_cache/modernbert_robotwin2_lang.pkl"),
+            da3_cache=DA3CacheConfig(inline=True, bgr_to_rgb=True, lang_cache="/work/jack/da3_cache/modernbert_robotwin2_lang.pkl"),  # robotwin2 videos are BGR-swapped -> correct at load
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi0_base/params",
