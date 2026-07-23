@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import concurrent.futures
 import logging
 import multiprocessing
 import os
@@ -28,6 +29,25 @@ from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+
+
+def _flag(name: str, default: str) -> bool:
+    """Env boolean. An unset OR exported-but-empty variable falls back to `default`."""
+    return (os.environ.get(name, "").strip().lower() or default) not in ("0", "false", "no", "off")
+
+
+# --- perf knobs (env-gated) -------------------------------------------------------------------
+# OPENPI_ASYNC_STAGE=0 : do the make_array_from_process_local_data staging inline on the main
+#   thread (the historical behavior) instead of one batch ahead on a worker thread.
+_ASYNC_STAGE = _flag("OPENPI_ASYNC_STAGE", "1")
+# OPENPI_TORCH_COLLATE=1 : collate with torch.stack + DataLoader pin_memory so the H2D copies
+#   (DA3 preprocess and the JAX staging) become async DMAs out of pinned host buffers instead of
+#   synchronous pageable copies. OFF by default -- it changes the leaf type of the batch
+#   (torch.Tensor instead of np.ndarray) and has not been validated on-device in this tree.
+_TORCH_COLLATE = _flag("OPENPI_TORCH_COLLATE", "0")
+# Depth of the inline-DA3 producer queue. Each buffered batch now holds ~0.5 GB of GPU memory
+# (DLPack keeps feats on-device), so lower this if HBM is tight.
+_DA3_PREFETCH = max(1, int(os.environ.get("OPENPI_DA3_PREFETCH", "3")))
 
 
 class Dataset(Protocol[T_co]):
@@ -241,6 +261,20 @@ class DA3CachedDataset(Dataset[T_co]):
         return out
 
 
+def _swap_channel_axis(x):
+    """Reverse the size-3 channel axis of one image (RGB<->BGR). Handles np/torch, CHW or HWC."""
+    shp = tuple(x.shape)
+    if len(shp) >= 3 and shp[-1] == 3:
+        ax = len(shp) - 1  # HWC
+    elif len(shp) >= 3 and shp[-3] == 3:
+        ax = len(shp) - 3  # CHW
+    else:
+        return x  # not a 3-channel image; leave as-is
+    if isinstance(x, np.ndarray):
+        return np.ascontiguousarray(np.flip(x, axis=ax))
+    return x.flip(ax)  # torch tensor
+
+
 class DA3InlineDataset(Dataset[T_co]):
     """Prepares raw DA3 inputs per frame for INLINE extraction (no precached features).
 
@@ -259,6 +293,9 @@ class DA3InlineDataset(Dataset[T_co]):
         # posed=False (UNPOSED, e.g. LIBERO 2-cam): no camera extrinsics/intrinsics in the dataset;
         # DA3 runs monocularly and the spatial bank drops the ray embedding.
         self._posed = bool(getattr(da3_cfg, "posed", True))
+        # Some datasets (e.g. RoboReal LeRobot) stored frames BGR-swapped; correct on load. Applied to
+        # raw here so BOTH the DA3 image path and the pi0.5 image path (self._transform) see corrected RGB.
+        self._bgr_to_rgb = bool(getattr(da3_cfg, "bgr_to_rgb", False))
         with open(da3_cfg.lang_cache, "rb") as f:
             self._lang = pickle.load(f)
 
@@ -267,6 +304,11 @@ class DA3InlineDataset(Dataset[T_co]):
 
     def __getitem__(self, idx: SupportsIndex) -> T_co:
         raw = self._base[int(idx)]
+        if self._bgr_to_rgb:  # reverse the size-3 channel axis of each view's frame (BGR->RGB)
+            for _v in self._vo:
+                _k = self._img_tmpl.format(v=_v)
+                if _k in raw:
+                    raw[_k] = _swap_channel_axis(raw[_k])
         imgs = []
         for v in self._vo:
             im = np.asarray(raw[self._img_tmpl.format(v=v)])
@@ -439,8 +481,16 @@ def create_torch_data_loader(
     if data_config.da3_cache is not None and data_config.da3_cache.inline:
         c = data_config.da3_cache
         logging.info("Building inline DA3-GIANT extractor (%s) ...", c.da3_model)
+        # OPENPI_DA3_FWD_CHUNK: how many samples per DA3-GIANT forward. Default 16 (unchanged).
+        # Raising it to 32 issues bigger, better-utilized extraction batches — worth ~1.03-1.05x
+        # when HBM allows. NOTE: nvidia-smi OVERSTATES usage here because JAX PREallocates
+        # XLA_PYTHON_CLIENT_MEM_FRACTION of the card up front; judge real headroom from actual
+        # allocation, not the nvidia-smi number.
+        _fwd_chunk = int(os.environ.get("OPENPI_DA3_FWD_CHUNK", "16"))
+        logging.info("DA3 inline forward_chunk = %d", _fwd_chunk)
         _extractor = _da3_extractor.DA3InlineExtractor(
-            model_name=c.da3_model, out_layers=tuple(c.da3_out_layers), da3_hw=tuple(c.da3_hw)
+            model_name=c.da3_model, out_layers=tuple(c.da3_out_layers), da3_hw=tuple(c.da3_hw),
+            forward_chunk=_fwd_chunk,
         )
 
         _posed = bool(getattr(c, "posed", True))
@@ -617,7 +667,10 @@ class TorchDataLoader:
             # Deeper prefetch so short CPU/bandwidth-contention bursts from co-located jobs don't
             # drain the buffer and starve the GPUs (io-wait is ~0, so the limiter is worker supply).
             prefetch_factor=(4 if num_workers > 0 else None),
-            collate_fn=_collate_fn,
+            collate_fn=_torch_collate_fn if _TORCH_COLLATE else _collate_fn,
+            # pin_memory runs in a dedicated main-process thread and only does anything for torch
+            # leaves, so it is tied to the torch collate. See _torch_collate_fn.
+            pin_memory=_TORCH_COLLATE and torch.cuda.is_available(),
             worker_init_fn=_worker_init_fn,
             drop_last=True,
             generator=generator,
@@ -654,9 +707,15 @@ class TorchDataLoader:
         # jitter between the DA3-forward (producer) and JAX-step (consumer) sharing the GPU can't
         # stall the consumer. Bigger buffers don't add GPU throughput (compute-bound) — this only
         # smooths the small bubble; costs ~1 extra transformed batch (~0.4 GB uint16 feats) in host RAM.
-        q: queue.Queue = queue.Queue(maxsize=3)
+        # Tunable via OPENPI_DA3_PREFETCH — with the DLPack handoff the buffered feats sit in GPU
+        # memory instead of host RAM, so lower it if HBM is tight.
+        q: queue.Queue = queue.Queue(maxsize=_DA3_PREFETCH)
 
         def producer():
+            # NOTE: no jax.block_until_ready() here, ever. The transform's JAX/torch work is
+            # dispatched asynchronously on purpose; blocking the producer until the device work
+            # lands serializes DA3 extraction against the train step and erases the overlap this
+            # thread exists to create.
             try:
                 for raw in epochs():
                     q.put(self._batch_transform(raw))
@@ -670,21 +729,67 @@ class TorchDataLoader:
                 raise item
             yield item
 
+    def _stage(self, batch):
+        """Assemble the process-local batch into globally-sharded jax.Arrays.
+
+        This is pure dispatch (index wrangling + an async H2D/D2D enqueue per leaf) — it never
+        waits on the device, and MUST NOT be made to (no block_until_ready).
+
+        jax.device_put reads `leaf.dtype` and cannot interpret a torch dtype, so torch leaves
+        (OPENPI_TORCH_COLLATE=1) are unwrapped with `.numpy()` — a zero-copy view that keeps the
+        underlying (pinned) host buffer, not a copy.
+        """
+
+        def stage(x):
+            if isinstance(x, torch.Tensor):
+                x = x.numpy()
+            return jax.make_array_from_process_local_data(self._sharding, x)
+
+        return jax.tree.map(stage, batch)
+
     def __iter__(self):
         num_items = 0
         batches = self._transformed_batches()
-        while True:
-            # Check BEFORE pulling: the generator prefetches, and pulling past num_batches would
-            # trigger (and discard) a whole extra batch across the epoch boundary.
-            if self._num_batches is not None and num_items >= self._num_batches:
-                return
-            batch = next(batches)
-            num_items += 1
-            # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
-            if self._sharding is not None:
-                yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
-            else:
+
+        if self._sharding is None:  # PyTorch framework: hand back torch tensors, no staging.
+            while True:
+                if self._num_batches is not None and num_items >= self._num_batches:
+                    return
+                batch = next(batches)
+                num_items += 1
                 yield jax.tree.map(torch.as_tensor, batch)
+
+        if not _ASYNC_STAGE:
+            while True:
+                # Check BEFORE pulling: the generator prefetches, and pulling past num_batches
+                # would trigger (and discard) a whole extra batch across the epoch boundary.
+                if self._num_batches is not None and num_items >= self._num_batches:
+                    return
+                batch = next(batches)
+                num_items += 1
+                yield self._stage(batch)
+
+        # Async staging: run _stage for batch N+1 on a worker thread while the caller is running
+        # the train step for batch N, so the per-leaf host work and the H2D enqueues stay off the
+        # main thread's critical path. Exactly one batch is ever in flight, and it is only
+        # requested when num_batches says another one is actually needed — so this never pulls
+        # (and discards) an extra batch from the underlying loader.
+        stager = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="batch-stage")
+        try:
+            pending = None
+            while True:
+                if self._num_batches is not None and num_items >= self._num_batches:
+                    return
+                if pending is None:
+                    pending = stager.submit(self._stage, next(batches))
+                staged = pending.result()
+                pending = None
+                num_items += 1
+                if self._num_batches is None or num_items < self._num_batches:
+                    pending = stager.submit(self._stage, next(batches))
+                yield staged
+        finally:
+            stager.shutdown(wait=False, cancel_futures=True)
 
 
 def _collate_fn(items):
@@ -692,6 +797,25 @@ def _collate_fn(items):
     # Make sure to convert to numpy arrays before stacking since some of the incoming elements
     # may be JAX arrays.
     return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+
+
+def _torch_stack(*xs):
+    """torch.stack numeric leaves (so DataLoader pin_memory can pin them), numpy for the rest."""
+    arrs = [np.asarray(x) for x in xs]
+    if arrs[0].dtype.kind in "biuf":  # bool/int/uint/float -> torch can hold it
+        return torch.stack([torch.from_numpy(np.ascontiguousarray(a)) for a in arrs], dim=0)
+    return np.stack(arrs, axis=0)  # e.g. string prompts / object arrays
+
+
+def _torch_collate_fn(items):
+    """Collate with torch tensors so the loader's pin_memory thread can pin the batch.
+
+    Pinned host buffers make every downstream host->device copy an async DMA
+    (`non_blocking=True` in DA3InlineExtractor._preprocess, and a pinned H2D inside
+    jax.device_put) rather than a synchronous copy out of pageable memory. Enabled with
+    OPENPI_TORCH_COLLATE=1.
+    """
+    return jax.tree.map(_torch_stack, *items)
 
 
 def _worker_init_fn(worker_id: int) -> None:

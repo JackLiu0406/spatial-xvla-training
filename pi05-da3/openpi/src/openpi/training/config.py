@@ -88,6 +88,13 @@ class DA3CacheConfig:
     # posed=False (UNPOSED, e.g. LIBERO 2-cam): no camera calibration in the dataset — skip the
     # extrinsic_cv/intrinsic_cv reads, run DA3 monocularly, feed only feats + lang to the model.
     posed: bool = True
+    # Correct a channel-swapped dataset AT LOAD TIME. The RoboReal LeRobot videos were built by a
+    # converter that stored frames BGR-swapped (beige→blue when viewed), so the frozen DA3-GIANT and
+    # SigLIP were being fed effectively-BGR images. Set True for those datasets: the raw camera frames
+    # are reversed on the channel axis in DA3InlineDataset — applied ONCE, before both the DA3 and the
+    # pi0.5 image paths read them, so they stay consistent. Leave False for datasets already stored as
+    # correct RGB (incl. anything built with the fixed converter, which no longer swaps).
+    bgr_to_rgb: bool = False
     # --- inline extraction ---
     inline: bool = False
     da3_model: str = "depth-anything/DA3NESTED-GIANT-LARGE-1.1"
@@ -543,6 +550,13 @@ class TrainConfig:
     # builds an optax.multi_transform keyed by openpi.training.optimizer.spatial_group_labels instead of
     # the single `lr_schedule`. Used by pi0.5-DA3 (vlm / core / geom on distinct LRs).
     lr_groups: tyro.conf.Suppress[dict[str, _optimizer.LRScheduleConfig] | None] = None
+    # Per-group AdamW eps. Required for the DA3 spatial branch, whose gradients sit 3-5 orders of
+    # magnitude below the 1e-8 default and are therefore swallowed by Adam's epsilon floor -- see
+    # create_multi_group_optimizer for the measurements. None = use the optimizer's own eps.
+    lr_group_eps: tyro.conf.Suppress[dict[str, float] | None] = None
+    # Per-group AdamW weight decay (FIX 3). The 1e-10 default is effectively no decay, which is what
+    # allowed the spatial attention projections to run away into softmax saturation. None = default.
+    lr_group_weight_decay: tyro.conf.Suppress[dict[str, float] | None] = None
     ema_decay: float | None = 0.99
 
     # Specifies which weights should be frozen.
@@ -805,7 +819,7 @@ _CONFIGS = [
                     )
                 ]
             ),
-            da3_cache=DA3CacheConfig(inline=True),  # no cache root — extract on the fly
+            da3_cache=DA3CacheConfig(inline=True, bgr_to_rgb=True),  # roboreal videos are BGR-swapped -> correct at load; extract on the fly
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params",
@@ -862,7 +876,7 @@ _CONFIGS = [
                     )
                 ]
             ),
-            da3_cache=DA3CacheConfig(inline=True),  # no cache root — extract on the fly
+            da3_cache=DA3CacheConfig(inline=True, bgr_to_rgb=True),  # roboreal videos are BGR-swapped -> correct at load; extract on the fly
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params",
@@ -917,19 +931,24 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params"
         ),
-        num_train_steps=30_000,
+        # EXTENDED 30k -> 44k for the +20k underfitting finetune (run stopped at 24k).
+        # decay_steps is stretched WITH num_train_steps, which is the whole point: under
+        # the old 30k schedule the LR at step 24k is 4.8e-6 (nearly floored), so 20k more
+        # steps would barely move the weights. Stretching the cosine to 44k makes the LR
+        # at the 24k resume point 1.25e-5 (~2.6x higher) and anneals it back to the 2.5e-6
+        # floor by 44k — a proper warm restart rather than 20k steps of noise.
+        # Config NAME must stay the same or --resume cannot find checkpoints/<config>/<exp>.
+        num_train_steps=44_000,
         # 128 (32/GPU x 4) to MATCH pi05_robotwin2_full_da3_inline_v2 — this run is
         # that config's A/B baseline, so batch must not be a confound.
+        # MEASURED: 128 uses ~123.2GB of 143.8GB/GPU. 196 (49/GPU) would need ~166GB => OOM.
         batch_size=128,
         num_workers=8,
-        # Set explicitly: the default CosineDecaySchedule decays over 30k, so leaving
-        # it implicit silently mismatches whenever num_train_steps != 30k (the earlier
-        # 50k staging would have floored at 2.5e-6 for its last 20k steps). Peak 2.5e-5
-        # is the documented pi0.5 finetune recipe and what pi05_roboreal_full used; it
-        # also equals the DA3 config's "vlm" peak, so the A/B is honest. Full finetune:
-        # freeze_filter is left at the default (nnx.Nothing) => every param trains.
+        # Peak 2.5e-5 is the documented pi0.5 finetune recipe and equals the DA3 config's
+        # "vlm" peak, so the A/B stays honest. Full finetune: freeze_filter is left at the
+        # default (nnx.Nothing) => every param trains.
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=30_000, decay_lr=2.5e-6
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=44_000, decay_lr=2.5e-6
         ),
         wandb_enabled=False,
         policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
@@ -971,14 +990,237 @@ _CONFIGS = [
             "gs://openpi-assets/checkpoints/pi05_base/params",
             missing_regex=r".*lora.*|.*spatial_bank_builder.*|.*spatial_inject.*",
         ),
+        # EXTENDED 50k -> 70k for the +20k underfitting finetune (run finished at 50k).
+        # All three groups' decay_steps stretch with num_train_steps. At 50k the OLD
+        # schedule had every group sitting exactly ON its floor (core 5e-5 / geom 1e-4 /
+        # vlm 2.5e-6), so resuming as-is would spend 20k steps at floor LR and learn almost
+        # nothing. Stretching to 70k lifts the 50k resume point to core 1.37e-4, geom
+        # 1.77e-4, vlm 6.85e-6 and anneals each back to its ORIGINAL floor by 70k.
+        # Config NAME must stay the same or --resume cannot find checkpoints/<config>/<exp>.
         lr_groups={
-            "vlm": _optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=50_000, decay_lr=2.5e-6),
-            "core": _optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=5e-4, decay_steps=50_000, decay_lr=5e-5),
-            "geom": _optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=5e-4, decay_steps=50_000, decay_lr=1e-4),
+            "vlm": _optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=70_000, decay_lr=2.5e-6),
+            "core": _optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=5e-4, decay_steps=70_000, decay_lr=5e-5),
+            "geom": _optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=5e-4, decay_steps=70_000, decay_lr=1e-4),
         },
-        num_train_steps=50_000,
+        num_train_steps=70_000,
+        # MEASURED: 128 (32/GPU) already peaks at ~140.2GB of 143.8GB/GPU with inline
+        # DA3-GIANT resident - only ~3.6GB headroom. This is the CEILING; do not raise.
         batch_size=128,
         num_workers=8,
+        wandb_enabled=False,
+        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
+    ),
+    # pi0.5 + DA3 "v3" — v2 recipe PLUS the two perceiver-collapse fixes. FRESH RETRAIN, not a
+    # resume: the fixes add params (perceiver log_gain + 2 LayerNorms per view), so v2 checkpoints
+    # cannot be restored into this tree. New config NAME keeps the v2 checkpoints loadable.
+    #
+    # WHY (measured, not speculative):
+    #   * The perceiver's latent queries NEVER trained — std still == init 0.05 with pairwise
+    #     cos ~0 after 50k steps (pi05-DA3) and 75k (X-VLA-DA3). They are frozen at random init.
+    #   * X-VLA-DA3's MAIN bank collapsed: its 128 tokens sit at pairwise cosine 1.0000 (left/right
+    #     survived at ~0.92), so the injection attends UNIFORMLY and geometry contributes only a
+    #     global constant, not "where" anything is.
+    #   * Cause: the perceiver's own cross-attn has no logit gain, so with untrained queries its
+    #     softmax over ~432 grid tokens is near-uniform => every query gets the same mean(V);
+    #     uniform attention also scales the softmax jacobian ~1/432, starving the Q/K grads so the
+    #     queries can never escape. The INJECTION got the gain fix in v2; the PERCEIVER never did.
+    #   * Compounding it, the residual added RAW q: ||q||~1.6 vs ||attn_out||~500 => query identity
+    #     swamped ~300:1.
+    # FIXES: perceiver_logit_gain_init=32.0 (same as the injection) + perceiver_balanced_residual
+    # (LayerNorm both sides of the query residual). Synthetic check: output token cosine
+    # 0.350 -> 0.023 (pi05) and 0.543 -> 0.037 (X-VLA). Everything else is identical to v2.
+    TrainConfig(
+        name="pi05_robotwin2_full_da3_inline_v3",
+        model=pi0_config.Pi0Config(pi05=True, da3=pi0_config.Pi0DA3Config(
+            enabled=True, spatial_init_std=0.01,
+            # ACTION-EXPERT (injection) gain: init 16, HARD-CAPPED at 32 (=2x init) by the clamp in
+            # gemma.py. v2 used an uncapped 32; an unbounded exp-parameterized gain is exactly what
+            # blew the perceiver's copy up to NaN at step 100, so this one is now bounded too.
+            attn_logit_gain=True, attn_logit_gain_init=16.0, attn_logit_gain_max=32.0,
+            bank_token_embed=True, perceiver_query_std=0.05,
+            # perceiver_logit_gain_init DISABLED: init 32 on the perceiver (432 keys) drove
+            # max|logit| to ~168 and the run went NaN by step 100 (reproduced twice, and with
+            # DLPack off, so it is the gain -- not the data path). balanced_residual alone
+            # targets the MEASURED root cause (||attn_out||~875-1200 swamping ||q||=1.6 by
+            # ~550:1) without adding an unbounded exponentiated parameter. Re-enable only with
+            # a much smaller init (<=4) now that the gain is clamped.
+            # PERCEIVER FIXES, b1k-style (same architecture in both codebases):
+            #   norm_attn_out  -> LN the ATTENTION OUTPUT before the residual (raw query preserved).
+            #       Fixes the measured collapse (||attn_out||~500-1200 vs ||q||~1.6 => bank tokens at
+            #       cosine 1.0000). My earlier version LN'd the QUERY too and NaN'd at step 100:
+            #       LN on a std-0.05 tensor amplifies its gradient 1/std (~20x, unbounded). Never do that.
+            #   logit_gain 8 (cap 16) -> sharpen the perceiver's own softmax over 432 patches so Q/K
+            #       actually train. 32 was measured at max|logit| ~168 and diverges; 8 is b1k's value.
+            perceiver_logit_gain=True, perceiver_logit_gain_init=8.0, perceiver_logit_gain_max=16.0,
+            perceiver_norm_attn_out=True,
+        )),
+        data=LeRobotAlohaDataConfig(
+            repo_id="robotwin2_aloha_lerobot",
+            assets=AssetsConfig(asset_id="robotwin2_aloha_lerobot"),
+            adapt_to_pi=False,
+            use_delta_joint_actions=True,
+            prompt_from_task=True,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.countertop",
+                                "cam_left_wrist": "observation.images.left",
+                                "cam_right_wrist": "observation.images.right",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            da3_cache=DA3CacheConfig(inline=True, lang_cache="/work/jack/da3_cache/modernbert_robotwin2_lang.pkl"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=r".*lora.*|.*spatial_bank_builder.*|.*spatial_inject.*",
+        ),
+        # Fresh 50k schedule, STAGED warmup (user-tuned):
+        #   vlm/core warm up fast (500 steps) — they are pretrained and stable.
+        #   geom warms up 3x SLOWER (1500 steps) — the spatial modules are fresh AND, with the
+        #   perceiver fixes, now emit genuinely varied geometry for the first time. Letting the
+        #   core settle first before geometry reaches full strength is the same staging that
+        #   rescued the X-VLA run (whose failure was geometry hitting peak LR too abruptly).
+        # Peaks are slightly hotter and floors slightly cooler than v2 => wider dynamic range.
+        lr_groups={
+            "vlm": _optimizer.CosineDecaySchedule(warmup_steps=500, peak_lr=3e-5, decay_steps=50_000, decay_lr=2e-6),
+            "core": _optimizer.CosineDecaySchedule(warmup_steps=500, peak_lr=6e-4, decay_steps=50_000, decay_lr=4e-5),
+            "geom": _optimizer.CosineDecaySchedule(warmup_steps=1_500, peak_lr=5e-4, decay_steps=50_000, decay_lr=5e-5),
+        },
+        # THE fix for the perceiver never training. Adam's update is mu/(sqrt(nu)+eps) and is
+        # scale-invariant only while sqrt(nu) >> eps. MEASURED at v3 step 6000 (and v2 step 49999,
+        # identically): every spatial param sits 3-5 orders of magnitude UNDER the 1e-8 default --
+        # perceiver query sqrt(nu)=2.6e-11, its q_proj 1.3e-12, the injection log_gain 1.7e-13 --
+        # while the vlm backbone sits at 2.9e-07. So eps dominated the denominator and the spatial
+        # branch received |update| ~1e-4..1e-6 against the vlm's 1.2e-1: frozen at init, exactly the
+        # "collapse" signature (query std still == 0.05 at 50k). The tiny gradients are expected
+        # (spatial_init_std=0.01 out-projections x softmax averaging over 432 patches); normalizing
+        # them away is Adam's job, and it can only do it once eps stops swallowing them.
+        # vlm keeps 1e-8 -- unaffected either way, and no reason to perturb a working group.
+        lr_group_eps={"core": 1e-16, "geom": 1e-16},
+        num_train_steps=50_000,
+        # 128 = 32/GPU x 4. MEASURED ceiling: ~140.2GB of 143.8GB with inline DA3-GIANT. Do not raise.
+        batch_size=128,
+        num_workers=8,
+        # Checkpoint every 2k; multiples of 10k are retained long-term (others GC'd once superseded).
+        save_interval=2_000,
+        keep_period=10_000,
+        wandb_enabled=False,
+        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
+    ),
+
+    TrainConfig(
+        name="pi05_robotwin2_full_da3_inline_v4",
+        model=pi0_config.Pi0Config(pi05=True, da3=pi0_config.Pi0DA3Config(
+            enabled=True, spatial_init_std=0.01,
+            # ACTION-EXPERT (injection) gain: init 16, HARD-CAPPED at 32 (=2x init) by the clamp in
+            # gemma.py. v2 used an uncapped 32; an unbounded exp-parameterized gain is exactly what
+            # blew the perceiver's copy up to NaN at step 100, so this one is now bounded too.
+            # FIX 1: QK-norm on BOTH attentions (perceiver and injection). Bounds |logits| to
+        # ~sqrt(head_dim) structurally instead of hoping the projections stay small.
+        attn_qk_norm=True, perceiver_qk_norm=True,
+        # FIX 7: keep per-patch magnitude through the layer projectors (see pi0_config).
+        fuse_proj_norm=False,
+        # FIX 2: with QK-norm the logits are O(1), so the gain is finally what it was meant to be --
+        # a learned TEMPERATURE, not an amplifier on a runaway. v3's init of 16/8 was tuned for the
+        # opposite regime (logits ~0, attention uniform) and is actively harmful on bounded logits.
+        # Start neutral at 1.0 and let it learn its own sharpness; cap well below the old values.
+        attn_logit_gain=True, attn_logit_gain_init=1.0, attn_logit_gain_max=8.0,
+            bank_token_embed=True, perceiver_query_std=0.05,
+            # perceiver_logit_gain_init DISABLED: init 32 on the perceiver (432 keys) drove
+            # max|logit| to ~168 and the run went NaN by step 100 (reproduced twice, and with
+            # DLPack off, so it is the gain -- not the data path). balanced_residual alone
+            # targets the MEASURED root cause (||attn_out||~875-1200 swamping ||q||=1.6 by
+            # ~550:1) without adding an unbounded exponentiated parameter. Re-enable only with
+            # a much smaller init (<=4) now that the gain is clamped.
+            # PERCEIVER FIXES, b1k-style (same architecture in both codebases):
+            #   norm_attn_out  -> LN the ATTENTION OUTPUT before the residual (raw query preserved).
+            #       Fixes the measured collapse (||attn_out||~500-1200 vs ||q||~1.6 => bank tokens at
+            #       cosine 1.0000). My earlier version LN'd the QUERY too and NaN'd at step 100:
+            #       LN on a std-0.05 tensor amplifies its gradient 1/std (~20x, unbounded). Never do that.
+            #   logit_gain 8 (cap 16) -> sharpen the perceiver's own softmax over 432 patches so Q/K
+            #       actually train. 32 was measured at max|logit| ~168 and diverges; 8 is b1k's value.
+            perceiver_logit_gain=True, perceiver_logit_gain_init=1.0, perceiver_logit_gain_max=8.0,
+            perceiver_norm_attn_out=True,
+        )),
+        data=LeRobotAlohaDataConfig(
+            repo_id="robotwin2_aloha_lerobot",
+            assets=AssetsConfig(asset_id="robotwin2_aloha_lerobot"),
+            adapt_to_pi=False,
+            use_delta_joint_actions=True,
+            prompt_from_task=True,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.countertop",
+                                "cam_left_wrist": "observation.images.left",
+                                "cam_right_wrist": "observation.images.right",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            da3_cache=DA3CacheConfig(inline=True, lang_cache="/work/jack/da3_cache/modernbert_robotwin2_lang.pkl"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=r".*lora.*|.*spatial_bank_builder.*|.*spatial_inject.*",
+        ),
+        # Fresh 50k schedule, STAGED warmup (user-tuned):
+        #   vlm/core warm up fast (500 steps) — they are pretrained and stable.
+        #   geom warms up 3x SLOWER (1500 steps) — the spatial modules are fresh AND, with the
+        #   perceiver fixes, now emit genuinely varied geometry for the first time. Letting the
+        #   core settle first before geometry reaches full strength is the same staging that
+        #   rescued the X-VLA run (whose failure was geometry hitting peak LR too abruptly).
+        # Peaks are slightly hotter and floors slightly cooler than v2 => wider dynamic range.
+        lr_groups={
+            # LR scaled by sqrt(2) for the 2x global batch (128 -> 256). Doubling the batch cuts
+            # gradient noise by sqrt(2), so sqrt scaling holds the noise-to-signal ratio -- and thus
+            # the training dynamics -- roughly fixed. Preferred over the linear rule here: linear is
+            # derived for SGD, and Adam already normalizes by gradient magnitude, so linear tends to
+            # overshoot. It is also the conservative choice given this branch has now failed twice
+            # from runaway dynamics (frozen-by-eps, then saturated-by-unbounded-logits).
+            # Step counts are HALVED so the run sees the same 6.4M samples as the 50k x 128 runs,
+            # keeping the comparison against v2/v3 sample-matched.
+            "vlm": _optimizer.CosineDecaySchedule(warmup_steps=250, peak_lr=4.2e-5, decay_steps=25_000, decay_lr=2.8e-6),
+            "core": _optimizer.CosineDecaySchedule(warmup_steps=250, peak_lr=8.5e-4, decay_steps=25_000, decay_lr=5.7e-5),
+            "geom": _optimizer.CosineDecaySchedule(warmup_steps=750, peak_lr=7.1e-4, decay_steps=25_000, decay_lr=7.1e-5),
+        },
+        # THE fix for the perceiver never training. Adam's update is mu/(sqrt(nu)+eps) and is
+        # scale-invariant only while sqrt(nu) >> eps. MEASURED at v3 step 6000 (and v2 step 49999,
+        # identically): every spatial param sits 3-5 orders of magnitude UNDER the 1e-8 default --
+        # perceiver query sqrt(nu)=2.6e-11, its q_proj 1.3e-12, the injection log_gain 1.7e-13 --
+        # while the vlm backbone sits at 2.9e-07. So eps dominated the denominator and the spatial
+        # branch received |update| ~1e-4..1e-6 against the vlm's 1.2e-1: frozen at init, exactly the
+        # "collapse" signature (query std still == 0.05 at 50k). The tiny gradients are expected
+        # (spatial_init_std=0.01 out-projections x softmax averaging over 432 patches); normalizing
+        # them away is Adam's job, and it can only do it once eps stops swallowing them.
+        # vlm keeps 1e-8 -- unaffected either way, and no reason to perturb a working group.
+        lr_group_eps={"core": 1e-16, "geom": 1e-16},
+        # FIX 3: real weight decay on the spatial groups only. 1e-10 is no decay at all, and is what
+        # let q_proj/k_proj grow until softmax saturated. Backbone ("vlm") keeps the default.
+        lr_group_weight_decay={"core": 1e-4, "geom": 1e-4},
+        num_train_steps=25_000,
+        # 8-GPU RUN. 256 = 32/GPU x 8. Per-GPU batch is UNCHANGED from the 4-GPU run because 32 is
+        # the MEASURED memory ceiling (~140.2GB of 143.8GB with inline DA3-GIANT resident); the
+        # global batch doubles purely by adding devices, so per-device memory is identical.
+        batch_size=256,
+        num_workers=8,
+        # Halved with the step count so checkpoints land at the same SAMPLE cadence as the 4-GPU runs.
+        save_interval=1_000,
+        keep_period=5_000,
         wandb_enabled=False,
         policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
     ),
@@ -1205,7 +1447,7 @@ _CONFIGS = [
                     )
                 ]
             ),
-            da3_cache=DA3CacheConfig(inline=True),  # no cache root — extract on the fly
+            da3_cache=DA3CacheConfig(inline=True, bgr_to_rgb=True),  # roboreal videos are BGR-swapped -> correct at load; extract on the fly
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi0_base/params",

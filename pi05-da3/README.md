@@ -95,6 +95,20 @@ export HF_HUB_OFFLINE=1          # once weights are cached
 > matches the tensor DA3 receives. Keep DA3 input dims aspect-correct (252×336 = 4:3) — do **not** let DA3
 > stretch to a square, or the pose math desyncs from the pixels.
 
+### Channel order (RGB/BGR) — IMPORTANT
+Both the frozen DA3-GIANT and SigLIP were pretrained on **RGB**, so feeding BGR silently degrades them
+(DA3 is frozen — it can't adapt). The training decoder returns `rgb24`, and there is **no swap in openpi**.
+The catch is upstream: **the pre-2026-07 RoboReal LeRobot videos were built BGR-swapped** (beige cabinets
+render blue). To correct that at load time — applied once, so the DA3 and SigLIP paths stay consistent —
+set `DA3CacheConfig(bgr_to_rgb=True)` (already on for the `*_roboreal_full_da3_inline*` configs). The
+dataset converter in `data_prep/convert_roboreal_merged_poses.py` has since been fixed (it no longer
+`cvtColor`s), so datasets rebuilt with it are correct RGB → use `bgr_to_rgb=False` for those.
+
+> The released `pi05-da3-robopro-tuned-v2` checkpoints on HF were trained **before** this fix (i.e. on the
+> BGR-swapped frames). They are internally consistent, so eval must feed them the **same** swapped
+> convention — do NOT "correct" eval frames to RGB for those checkpoints. Models trained *after* the fix
+> (with `bgr_to_rgb=True`) expect correct **RGB** at eval.
+
 ---
 
 ## 4. Compute normalization stats (once per dataset)
