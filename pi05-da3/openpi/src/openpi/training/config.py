@@ -902,6 +902,52 @@ _CONFIGS = [
     ),
     # ===== RoboTwin2.0-aloha benchmark (head=main, left/right wrists; 14-dim bimanual) =====
     # pi0.5 BASE (no DA3). Mirrors pi05_roboreal_full on the RoboTwin2 LeRobot dataset.
+    # ===== RoboDyna suite: vanilla pi0.5, 16 tasks x 4 setups merged (3200 demos) =====
+    # Merged from Hoshipu/robodyna-lerobot-suite by scripts/merge_robodyna.py into the canonical
+    # LeRobot v2.1 layout at $HF_LEROBOT_HOME/robodyna_merged. aloha-agilex, 14-dim state/action,
+    # 3 cams (head/left_wrist/right_wrist @ 240x320), 16 unique task prompts. 4-GPU, bs=256, 40k.
+    TrainConfig(
+        name="pi05_robodyna_full",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="robodyna_merged",
+            assets=AssetsConfig(asset_id="robodyna_merged"),
+            adapt_to_pi=False,
+            use_delta_joint_actions=True,
+            prompt_from_task=True,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head",
+                                "cam_left_wrist": "observation.images.left_wrist",
+                                "cam_right_wrist": "observation.images.right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        # 40k x 256 = 10.24M samples over 801k frames ~= 12.8 epochs.
+        num_train_steps=40_000,
+        # 256 = 64/GPU x 4. NOTE: robotwin2 measured 32/GPU (bs128) at ~123GB with NO DA3; this is
+        # also DA3-free so the VLM+action-expert footprint is the same, but 64/GPU ~ 2x activations.
+        # If it OOMs, drop to 192 (48/GPU) or 128 and lengthen num_train_steps to keep the epoch count.
+        batch_size=256,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6
+        ),
+        wandb_enabled=False,
+        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
+    ),
     TrainConfig(
         name="pi05_robotwin2_full",
         model=pi0_config.Pi0Config(pi05=True),
@@ -1224,6 +1270,218 @@ _CONFIGS = [
         wandb_enabled=False,
         policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
     ),
+    # RoboTwin 2.0 pi0.5 + DA3 v5: selective port of the successful B1K "newbank"
+    # spatial architecture. This is a FRESH model: K/V split, locality, query token
+    # embeddings, and cross-view fusion all add/change spatial parameters.
+    TrainConfig(
+        name="pi05_robotwin2_full_da3_inline_v5",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            da3=pi0_config.Pi0DA3Config(
+                enabled=True,
+                spatial_init_std=0.01,
+                spatial_scale=1.0,
+                # QK-normalized gains are temperatures; 3 attends locally without
+                # approaching the hard-argmax regime. Both are bounded at 8.
+                attn_qk_norm=True,
+                perceiver_qk_norm=True,
+                attn_logit_gain=True,
+                attn_logit_gain_init=3.0,
+                attn_logit_gain_max=8.0,
+                perceiver_logit_gain=True,
+                perceiver_logit_gain_init=3.0,
+                perceiver_logit_gain_max=8.0,
+                perceiver_norm_attn_out=False,
+                perceiver_norm_out=True,
+                fuse_proj_norm=False,
+                bank_token_embed=True,
+                bank_token_embed_query=True,
+                perceiver_query_std=0.05,
+                # B1K newbank architecture, adapted to RoboTwin's posed 18x24 grid.
+                kv_split=True,
+                depth_dropout=0.5,
+                pos_emb_scale=0.25,
+                perc_locality=True,
+                locality_gamma_init=4.0,
+                cross_view=True,
+                cross_view_depth=2,
+                # Batch centering is diagnostic-only: batch=1 serving would zero it.
+                bank_center=False,
+            ),
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="robotwin2_aloha_lerobot",
+            # Same dataset/action normalization as v3/v4; reuse the measured stats.
+            assets=AssetsConfig(
+                assets_dir="/work/jack/openpi_src/openpi/assets/pi05_robotwin2_full_da3_inline_v3",
+                asset_id="robotwin2_aloha_lerobot",
+            ),
+            adapt_to_pi=False,
+            use_delta_joint_actions=True,
+            prompt_from_task=True,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.countertop",
+                                "cam_left_wrist": "observation.images.left",
+                                "cam_right_wrist": "observation.images.right",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            da3_cache=DA3CacheConfig(
+                inline=True,
+                bgr_to_rgb=True,
+                lang_cache="/work/jack/da3_cache/modernbert_robotwin2_lang.pkl",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=r".*lora.*|.*spatial_bank_builder.*|.*spatial_inject.*",
+        ),
+        # Same 6.4M-sample budget as v3 (50k x 128), using 8 x H200 at
+        # the measured-safe per-device batch of 32.
+        lr_groups={
+            "vlm": _optimizer.DelayRampPlateauCosine(
+                delay_steps=1_250,
+                ramp_steps=3_750,
+                ramp_start_lr=1e-6,
+                peak_lr=1e-5,
+                decay_start=12_500,
+                decay_steps=25_000,
+                decay_lr=1e-6,
+            ),
+            "core": _optimizer.DelayRampPlateauCosine(
+                peak_lr=1e-4,
+                decay_start=12_500,
+                decay_steps=25_000,
+                decay_lr=1e-5,
+            ),
+            "geom": _optimizer.DelayRampPlateauCosine(
+                peak_lr=1e-4,
+                decay_start=12_500,
+                decay_steps=25_000,
+                decay_lr=1e-5,
+            ),
+        },
+        lr_group_eps={"core": 1e-16, "geom": 1e-16},
+        lr_group_weight_decay={"core": 1e-4, "geom": 1e-4},
+        num_train_steps=25_000,
+        batch_size=256,
+        num_workers=8,
+        save_interval=1_000,
+        keep_period=5_000,
+        wandb_enabled=False,
+        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
+    ),
+    # Four-GPU, sample-matched v5. Per-device batch remains 32; step and
+    # schedule timings are exactly 2x the 8-GPU recipe, preserving 6.4M samples.
+    TrainConfig(
+        name="pi05_robotwin2_full_da3_inline_v5_4gpu",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            da3=pi0_config.Pi0DA3Config(
+                enabled=True,
+                spatial_init_std=0.01,
+                spatial_scale=1.0,
+                attn_qk_norm=True,
+                perceiver_qk_norm=True,
+                attn_logit_gain=True,
+                attn_logit_gain_init=3.0,
+                attn_logit_gain_max=8.0,
+                perceiver_logit_gain=True,
+                perceiver_logit_gain_init=3.0,
+                perceiver_logit_gain_max=8.0,
+                perceiver_norm_attn_out=False,
+                perceiver_norm_out=True,
+                fuse_proj_norm=False,
+                bank_token_embed=True,
+                bank_token_embed_query=True,
+                perceiver_query_std=0.05,
+                kv_split=True,
+                depth_dropout=0.5,
+                pos_emb_scale=0.25,
+                perc_locality=True,
+                locality_gamma_init=4.0,
+                cross_view=True,
+                cross_view_depth=2,
+                bank_center=False,
+            ),
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="robotwin2_aloha_lerobot",
+            assets=AssetsConfig(
+                assets_dir="/work/jack/openpi_src/openpi/assets/pi05_robotwin2_full_da3_inline_v3",
+                asset_id="robotwin2_aloha_lerobot",
+            ),
+            adapt_to_pi=False,
+            use_delta_joint_actions=True,
+            prompt_from_task=True,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.countertop",
+                                "cam_left_wrist": "observation.images.left",
+                                "cam_right_wrist": "observation.images.right",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            da3_cache=DA3CacheConfig(
+                inline=True,
+                bgr_to_rgb=True,
+                lang_cache="/work/jack/da3_cache/modernbert_robotwin2_lang.pkl",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=r".*lora.*|.*spatial_bank_builder.*|.*spatial_inject.*",
+        ),
+        lr_groups={
+            "vlm": _optimizer.DelayRampPlateauCosine(
+                delay_steps=2_500,
+                ramp_steps=7_500,
+                ramp_start_lr=1e-6,
+                peak_lr=1e-5,
+                decay_start=25_000,
+                decay_steps=50_000,
+                decay_lr=1e-6,
+            ),
+            "core": _optimizer.DelayRampPlateauCosine(
+                peak_lr=1e-4,
+                decay_start=25_000,
+                decay_steps=50_000,
+                decay_lr=1e-5,
+            ),
+            "geom": _optimizer.DelayRampPlateauCosine(
+                peak_lr=1e-4,
+                decay_start=25_000,
+                decay_steps=50_000,
+                decay_lr=1e-5,
+            ),
+        },
+        lr_group_eps={"core": 1e-16, "geom": 1e-16},
+        lr_group_weight_decay={"core": 1e-4, "geom": 1e-4},
+        num_train_steps=50_000,
+        batch_size=128,
+        num_workers=8,
+        save_interval=2_000,
+        keep_period=10_000,
+        wandb_enabled=False,
+        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
+    ),
     #
     # ===== LIBERO ablation (train on CLEAN LIBERO, eval on LIBERO + LIBERO-plus) =====
     # physical-intelligence/libero: 40 tasks, 1693 eps, panda single-arm, 2 cams
@@ -1405,16 +1663,19 @@ _CONFIGS = [
                             "actions": "action",
                             "prompt":  "prompt",
                         }
-                    )
+                    ),
+                    # RoboReal LeRobot videos are BGR-swapped (beige->blue); correct to RGB here, once,
+                    # right after repack. (No DA3 in this baseline, so DA3CacheConfig.bgr_to_rgb doesn't apply.)
+                    _transforms.SwapImageChannels(key="images"),
                 ]
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi0_base/params"
         ),
-        num_train_steps=20_000,
+        num_train_steps=30_000,
         batch_size=96,
-        num_workers=16,
+        num_workers=8,
         wandb_enabled=False,
         policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
     ),

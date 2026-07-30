@@ -192,6 +192,38 @@ class ResizeImages(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class SwapImageChannels(DataTransformFn):
+    """Reverse the channel axis (RGB<->BGR) of every image under `key`.
+
+    For datasets whose stored frames are channel-swapped (e.g. the pre-2026-07 RoboReal LeRobot
+    videos, beige->blue), so the model receives correct RGB. Insert ONCE, right after RepackTransform,
+    before any downstream image transform. Handles CHW/HWC and numpy/torch. (The DA3 inline path has
+    its own equivalent via DA3CacheConfig.bgr_to_rgb; use this for the non-DA3, standard pipeline.)
+    """
+
+    key: str = "images"
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.key not in data:
+            return data
+
+        def _swap(v):
+            shp = tuple(v.shape)
+            if len(shp) >= 3 and shp[-1] == 3:
+                ax = len(shp) - 1  # HWC
+            elif len(shp) >= 3 and shp[-3] == 3:
+                ax = len(shp) - 3  # CHW
+            else:
+                return v
+            if isinstance(v, np.ndarray):
+                return np.ascontiguousarray(np.flip(v, axis=ax))
+            return v.flip(ax)  # torch tensor
+
+        data[self.key] = {k: _swap(v) for k, v in data[self.key].items()}
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class SubsampleActions(DataTransformFn):
     stride: int
 
